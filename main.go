@@ -1,12 +1,13 @@
-package pubsub
+package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
+	"net/http"
+	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -15,29 +16,38 @@ import (
 	"github.com/luraproject/lura/v2/proxy"
 )
 
-// Namespace constants
 const (
-	publisherNamespace  = "github.com/devopsfaith/krakend-pubsub/publisher"
-	subscriberNamespace = "github.com/devopsfaith/krakend-pubsub/subscriber"
+	publisherNamespace  = "pubsub/publisher"
+	subscriberNamespace = "pubsub/subscriber"
 )
 
-// Config structs
+// Publisher config
 type publisherCfg struct {
-	Topic_url  string
-	Queue_size int
+	Topic_url  string `json:"topic_url,omitempty"`
+	Queue_size int    `json:"queue_size,omitempty"`
 }
 
+// Subscriber config
 type subscriberCfg struct {
-	Subscription_url string
-	Group_id         string
-	Batch_size       int
+	Topic    string `json:"topic,omitempty"`
+	Group_id string `json:"group_id,omitempty"`
 }
 
-// BackendFactory main struct
+// BackendFactory holds plugin state
 type BackendFactory struct {
-	ctx    context.Context
-	logger logging.Logger
-	bf     proxy.BackendFactory
+	ctx              context.Context
+	logger           logging.Logger
+	bf               proxy.BackendFactory
+	producer         sarama.SyncProducer
+	producerHealthy  bool
+	consumerHealthy  bool
+	consumer         sarama.ConsumerGroup
+	producerLock     sync.RWMutex
+	consumerLock     sync.RWMutex
+	msgQueue         chan []byte
+	producerTopic    string
+	subscriberTopics []string
+	groupID          string
 }
 
 // Constructor
@@ -51,12 +61,18 @@ func NewBackendFactory(ctx context.Context, logger logging.Logger, bf proxy.Back
 
 // Main New method
 func (f *BackendFactory) New(remote *config.Backend) proxy.Proxy {
+
+	// Try subscriber
 	if prxy, err := f.initSubscriber(f.ctx, remote); err == nil {
 		return prxy
 	}
+
+	// Try publisher
 	if prxy, err := f.initPublisher(f.ctx, remote); err == nil {
 		return prxy
 	}
+
+	// fallback
 	return f.bf(remote)
 }
 
@@ -64,19 +80,12 @@ func (f *BackendFactory) New(remote *config.Backend) proxy.Proxy {
 func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backend) (proxy.Proxy, error) {
 	cfg := &publisherCfg{}
 	if err := getConfig(remote, publisherNamespace, cfg); err != nil {
-		return proxy.NoopProxy, err
+		return nil, fmt.Errorf("config error: %v", err)
 	}
 
-	brokers := []string{}
-	if env := remote.ExtraConfig["KAFKA_BROKERS"]; env != nil {
-		if list, ok := env.([]interface{}); ok {
-			for _, v := range list {
-				brokers = append(brokers, v.(string))
-			}
-		}
-	}
+	brokers := parseBrokers(remote)
 	if len(brokers) == 0 {
-		return proxy.NoopProxy, fmt.Errorf("KAFKA_BROKERS not set")
+		return nil, fmt.Errorf("KAFKA_BROKERS not set")
 	}
 
 	saramaCfg := sarama.NewConfig()
@@ -86,54 +95,75 @@ func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backe
 
 	producer, err := sarama.NewSyncProducer(brokers, saramaCfg)
 	if err != nil {
-		return proxy.NoopProxy, err
+		return nil, fmt.Errorf("producer init error: %v", err)
 	}
 
-	if cfg.Queue_size < 1 {
-		cfg.Queue_size = 1
-	}
-	msgQueue := make(chan []byte, cfg.Queue_size)
-
-	// Worker goroutine
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				close(msgQueue)
-				producer.Close()
-				return
-			case msg, ok := <-msgQueue:
-				if !ok {
-					return
-				}
-				for {
-					_, _, err := producer.SendMessage(&sarama.ProducerMessage{
-						Topic: cfg.Topic_url,
-						Value: sarama.ByteEncoder(msg),
-					})
-					if err != nil {
-						f.logger.Error("[Publisher] Kafka send failed, retrying:", err)
-						time.Sleep(1 * time.Second)
-						continue
-					}
-					break
-				}
-			}
-		}
-	}()
+	f.producerLock.Lock()
+	f.producer = producer
+	f.producerHealthy = true
+	f.producerLock.Unlock()
+	f.producerTopic = cfg.Topic_url
 
 	return func(ctx context.Context, r *proxy.Request) (*proxy.Response, error) {
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			return nil, err
+		var body []byte
+		if r.Body != nil {
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				respBody := map[string]interface{}{"error": fmt.Sprintf("read body error: %v", err)}
+				return &proxy.Response{
+					IsComplete: true,
+					Data:       respBody,
+					Metadata: proxy.Metadata{
+						Headers:    map[string][]string{"Content-Type": {"application/json"}},
+						StatusCode: http.StatusBadRequest,
+					},
+				}, nil
+			}
+			body = b
 		}
 
-		select {
-		case msgQueue <- body:
-			return &proxy.Response{IsComplete: true}, nil
-		default:
-			return nil, fmt.Errorf("queue full, cannot produce message")
+		if len(body) == 0 {
+			respBody := map[string]interface{}{"error": "empty body"}
+			return &proxy.Response{
+				IsComplete: true,
+				Data:       respBody,
+				Metadata: proxy.Metadata{
+					Headers:    map[string][]string{"Content-Type": {"application/json"}},
+					StatusCode: http.StatusBadRequest,
+				},
+			}, nil
 		}
+
+		_, _, err := f.producer.SendMessage(&sarama.ProducerMessage{
+			Topic: f.producerTopic,
+			Value: sarama.ByteEncoder(body),
+		})
+		if err != nil {
+			f.setProducerHealthy(false)
+			respBody := map[string]interface{}{"error": fmt.Sprintf("kafka send failed: %v", err)}
+			return &proxy.Response{
+				IsComplete: true,
+				Data:       respBody,
+				Metadata: proxy.Metadata{
+					Headers:    map[string][]string{"Content-Type": {"application/json"}},
+					StatusCode: http.StatusInternalServerError,
+				},
+			}, nil
+		}
+
+		f.setProducerHealthy(true)
+		okBody := map[string]interface{}{
+			"status": "sent",
+			"topic":  f.producerTopic,
+		}
+		return &proxy.Response{
+			IsComplete: true,
+			Data:       okBody,
+			Metadata: proxy.Metadata{
+				Headers:    map[string][]string{"Content-Type": {"application/json"}},
+				StatusCode: http.StatusOK,
+			},
+		}, nil
 	}, nil
 }
 
@@ -144,24 +174,14 @@ func (f *BackendFactory) initSubscriber(ctx context.Context, remote *config.Back
 		return proxy.NoopProxy, err
 	}
 
-	if cfg.Batch_size < 1 {
-		cfg.Batch_size = 1
-	}
-
-	brokers := []string{}
-	if env := remote.ExtraConfig["KAFKA_BROKERS"]; env != nil {
-		if list, ok := env.([]interface{}); ok {
-			for _, v := range list {
-				brokers = append(brokers, v.(string))
-			}
-		}
-	}
+	brokers := parseBrokers(remote)
 	if len(brokers) == 0 {
 		return proxy.NoopProxy, fmt.Errorf("KAFKA_BROKERS not set")
 	}
 
 	saramaCfg := sarama.NewConfig()
-	saramaCfg.Consumer.Return.Errors = true
+	saramaCfg.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategyRange
+	saramaCfg.Consumer.Offsets.AutoCommit.Enable = false
 	saramaCfg.Version = sarama.V2_1_0_0
 
 	consumer, err := sarama.NewConsumerGroup(brokers, cfg.Group_id, saramaCfg)
@@ -169,22 +189,29 @@ func (f *BackendFactory) initSubscriber(ctx context.Context, remote *config.Back
 		return proxy.NoopProxy, err
 	}
 
+	f.consumerLock.Lock()
+	f.consumer = consumer
+	f.consumerHealthy = true
+	f.consumerLock.Unlock()
+	f.subscriberTopics = []string{cfg.Topic}
+	f.groupID = cfg.Group_id
+
 	ef := proxy.NewEntityFormatter(remote)
 
 	return func(ctx context.Context, _ *proxy.Request) (*proxy.Response, error) {
-		batch := []map[string]interface{}{}
-		handler := &consumerGroupHandler{
-			batchSize: cfg.Batch_size,
-			decoder:   remote.Decoder,
-			batch:     &batch,
-			done:      make(chan struct{}),
+		var msg map[string]interface{}
+
+		handler := &singleMessageHandler{
+			msg:  &msg,
+			done: make(chan struct{}),
 		}
 
 		go func() {
 			for {
-				err := consumer.Consume(ctx, []string{cfg.Subscription_url}, handler)
+				err := f.consumer.Consume(ctx, f.subscriberTopics, handler)
 				if err != nil {
 					log.Println("[Subscriber] Consume error:", err)
+					f.setConsumerHealthy(false)
 					time.Sleep(1 * time.Second)
 					continue
 				}
@@ -192,36 +219,52 @@ func (f *BackendFactory) initSubscriber(ctx context.Context, remote *config.Back
 			}
 		}()
 
-		<-handler.done
-		resp := &proxy.Response{Data: batch, IsComplete: true}
-		resp = ef.Format(*resp)
-		return resp, nil
+		select {
+		case <-handler.done:
+			f.setConsumerHealthy(true)
+			resp := ef.Format(proxy.Response{Data: msg, IsComplete: true})
+			return &resp, nil
+		case <-time.After(5 * time.Second):
+			return nil, fmt.Errorf("timeout: no message received")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}, nil
 }
 
-// ==================== Helper ====================
-type consumerGroupHandler struct {
-	batchSize int
-	decoder   config.Decoder
-	batch     *[]map[string]interface{}
-	done      chan struct{}
+// ==================== Helper functions ====================
+func (f *BackendFactory) setProducerHealthy(val bool) {
+	f.producerLock.Lock()
+	f.producerHealthy = val
+	f.producerLock.Unlock()
 }
 
-func (h *consumerGroupHandler) Setup(sarama.ConsumerGroupSession) error   { return nil }
-func (h *consumerGroupHandler) Cleanup(sarama.ConsumerGroupSession) error { return nil }
-func (h *consumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	count := 0
-	for msg := range claim.Messages() {
-		var data map[string]interface{}
-		h.decoder(bytes.NewBuffer(msg.Value), &data)
-		*h.batch = append(*h.batch, data)
-		sess.MarkMessage(msg, "")
-		count++
-		if count >= h.batchSize {
-			break
+func (f *BackendFactory) setConsumerHealthy(val bool) {
+	f.consumerLock.Lock()
+	f.consumerHealthy = val
+	f.consumerLock.Unlock()
+}
+
+type singleMessageHandler struct {
+	msg  *map[string]interface{}
+	done chan struct{}
+}
+
+func (h *singleMessageHandler) Setup(sarama.ConsumerGroupSession) error   { return nil }
+func (h *singleMessageHandler) Cleanup(sarama.ConsumerGroupSession) error { return nil }
+
+func (h *singleMessageHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	for message := range claim.Messages() {
+		var m map[string]interface{}
+		if err := json.Unmarshal(message.Value, &m); err != nil {
+			log.Println("[Subscriber] decode error:", err)
+			continue
 		}
+		*h.msg = m
+		sess.MarkMessage(message, "")
+		close(h.done)
+		return nil
 	}
-	close(h.done)
 	return nil
 }
 
@@ -235,4 +278,18 @@ func getConfig(remote *config.Backend, namespace string, v interface{}) error {
 		return err
 	}
 	return json.Unmarshal(raw, &v)
+}
+
+func parseBrokers(remote *config.Backend) []string {
+	brokers := []string{}
+	if env := remote.ExtraConfig["KAFKA_BROKERS"]; env != nil {
+		if list, ok := env.([]interface{}); ok {
+			for _, v := range list {
+				if str, ok := v.(string); ok {
+					brokers = append(brokers, str)
+				}
+			}
+		}
+	}
+	return brokers
 }
