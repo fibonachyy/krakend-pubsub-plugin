@@ -191,3 +191,9 @@ func getConfig(remote *config.Backend, namespace string, v interface{}) error {
 	}
 	return json.Unmarshal(raw, &v)
 }
+func BackendFactoryFunc(ctx context.Context, logger logging.Logger, bf proxy.BackendFactory) proxy.BackendFactory {
+	    logger.Info("🚀 My Plugin successfully loaded!")
+    return NewBackendFactory(ctx, logger, bf).New
+}
+
+var Plugin = BackendFactoryFunc
