@@ -6,194 +6,140 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 
 	"github.com/IBM/sarama"
-	"github.com/luraproject/lura/v2/config"
 	"github.com/luraproject/lura/v2/logging"
-	"github.com/luraproject/lura/v2/proxy"
 )
 
 const (
-	publisherNamespace = "pubsub/publisher"
+	pluginName      = "krakend-pubsub-plugin"
+	pluginNamespace = "plugin/http-client"
 )
 
-// Publisher config
-type publisherCfg struct {
-	Topic_url  string `json:"topic_url,omitempty"`
-	Queue_size int    `json:"queue_size,omitempty"`
+// Exported variable KrakenD loader expects
+var ClientRegisterer registerer = pluginName
+
+type registerer string
+
+var logger logging.Logger
+
+// Logger loader
+func (r registerer) RegisterLogger(l interface{}) {
+	lg, ok := l.(logging.Logger)
+	if !ok {
+		return
+	}
+	logger = lg
+	logger.Debug(fmt.Sprintf("[PLUGIN: %s] Logger loaded", r))
 }
 
-// BackendFactory holds plugin state
-type BackendFactory struct {
-	ctx             context.Context
-	logger          logging.Logger
-	bf              proxy.BackendFactory
-	producer        sarama.SyncProducer
-	producerHealthy bool
-	producerLock    sync.RWMutex
-	producerTopic   string
+// RegisterClients is called by KrakenD to register your plugin
+func (r registerer) RegisterClients(f func(
+	name string,
+	handler func(ctx context.Context, extra map[string]interface{}) (http.Handler, error),
+)) {
+	f(string(r), r.registerClients)
 }
 
-// Constructor
-func NewBackendFactory(ctx context.Context, logger logging.Logger, bf proxy.BackendFactory) *BackendFactory {
-	return &BackendFactory{
-		ctx:    ctx,
-		logger: logger,
-		bf:     bf,
+// Actual HTTP handler for KrakenD backend
+func (r registerer) registerClients(_ context.Context, extra map[string]interface{}) (http.Handler, error) {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil || len(body) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"error":"invalid or empty body"}`))
+			return
+		}
+		
+		cfg := parseExtraConfig(extra)
+		fmt.Println("cfg", cfg)
+		if cfg == nil || len(cfg.Brokers) == 0 {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"error":"kafka config invalid"}`))
+			return
+		}
+
+		producer, err := newKafkaProducer(cfg.Brokers)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(fmt.Sprintf(`{"error":"producer init failed: %v"}`, err)))
+			return
+		}
+		defer producer.Close()
+
+		_, _, err = producer.SendMessage(&sarama.ProducerMessage{
+			Topic: cfg.Topic,
+			Value: sarama.ByteEncoder(body),
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(fmt.Sprintf(`{"error":"kafka send failed: %v"}`, err)))
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(fmt.Sprintf(`{"status":"sent","topic":"%s"}`, cfg.Topic)))
+	}), nil
+}
+
+// ---------------- Kafka helpers ----------------
+
+type pluginCfg struct {
+	Topic   string
+	Brokers []string
+}
+
+func parseExtraConfig(extra map[string]interface{}) *pluginCfg {
+	fmt.Println(extra)
+	// rawOuter, ok := extra[pluginNamespace]
+	// if !ok {
+	// 	return nil
+	// }
+
+	// outer, ok := rawOuter.(map[string]interface{})
+	// if !ok {
+	// 	return nil
+	// }
+
+	rawCfg, ok := extra[pluginName]
+	if !ok {
+		return nil
+	}
+
+	b, err := json.Marshal(rawCfg)
+	if err != nil {
+		return nil
+	}
+
+	cfg := struct {
+		Topic   string   `json:"topic_url"`
+		Brokers []string `json:"brokers"`
+	}{}
+
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return nil
+	}
+
+	return &pluginCfg{
+		Topic:   cfg.Topic,
+		Brokers: cfg.Brokers,
 	}
 }
 
-// Main New method
-func (f *BackendFactory) New(remote *config.Backend) proxy.Proxy {
-
-	// Try publisher
-	if prxy, err := f.initPublisher(f.ctx, remote); err == nil {
-		return prxy
-	}
-
-	// fallback
-	return f.bf(remote)
-}
-
-// ==================== Publisher ====================
-func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backend) (proxy.Proxy, error) {
-	cfg := &publisherCfg{}
-	if err := getConfig(remote, publisherNamespace, cfg); err != nil {
-		return nil, fmt.Errorf("config error: %v", err)
-	}
-
-	brokers := parseBrokers(remote)
-	if len(brokers) == 0 {
-		return nil, fmt.Errorf("KAFKA_BROKERS not set")
-	}
-
+func newKafkaProducer(brokers []string) (sarama.SyncProducer, error) {
 	saramaCfg := sarama.NewConfig()
 	saramaCfg.Producer.RequiredAcks = sarama.WaitForAll
 	saramaCfg.Producer.Retry.Max = 5
 	saramaCfg.Producer.Return.Successes = true
 
-	producer, err := sarama.NewSyncProducer(brokers, saramaCfg)
-	if err != nil {
-		return nil, fmt.Errorf("producer init error: %v", err)
-	}
-
-	f.producerLock.Lock()
-	f.producer = producer
-	f.producerHealthy = true
-	f.producerLock.Unlock()
-	f.producerTopic = cfg.Topic_url
-
-	return func(ctx context.Context, r *proxy.Request) (*proxy.Response, error) {
-		var body []byte
-		if r.Body != nil {
-			b, err := io.ReadAll(r.Body)
-			if err != nil {
-				respBody := map[string]interface{}{"error": fmt.Sprintf("read body error: %v", err)}
-				return &proxy.Response{
-					IsComplete: true,
-					Data:       respBody,
-					Metadata: proxy.Metadata{
-						Headers:    map[string][]string{"Content-Type": {"application/json"}},
-						StatusCode: http.StatusBadRequest,
-					},
-				}, nil
-			}
-			body = b
-		}
-
-		if len(body) == 0 {
-			respBody := map[string]interface{}{"error": "empty body"}
-			return &proxy.Response{
-				IsComplete: true,
-				Data:       respBody,
-				Metadata: proxy.Metadata{
-					Headers:    map[string][]string{"Content-Type": {"application/json"}},
-					StatusCode: http.StatusBadRequest,
-				},
-			}, nil
-		}
-
-		_, _, err := f.producer.SendMessage(&sarama.ProducerMessage{
-			Topic: f.producerTopic,
-			Value: sarama.ByteEncoder(body),
-		})
-		if err != nil {
-			f.setProducerHealthy(false)
-			respBody := map[string]interface{}{"error": fmt.Sprintf("kafka send failed: %v", err)}
-			return &proxy.Response{
-				IsComplete: true,
-				Data:       respBody,
-				Metadata: proxy.Metadata{
-					Headers:    map[string][]string{"Content-Type": {"application/json"}},
-					StatusCode: http.StatusInternalServerError,
-				},
-			}, nil
-		}
-
-		f.setProducerHealthy(true)
-		okBody := map[string]interface{}{
-			"status": "sent",
-			"topic":  f.producerTopic,
-		}
-		return &proxy.Response{
-			IsComplete: true,
-			Data:       okBody,
-			Metadata: proxy.Metadata{
-				Headers:    map[string][]string{"Content-Type": {"application/json"}},
-				StatusCode: http.StatusOK,
-			},
-		}, nil
-	}, nil
+	return sarama.NewSyncProducer(brokers, saramaCfg)
 }
 
-// helper: read brokers from extra_config (handles []interface{} from JSON)
-func parseBrokers(remote *config.Backend) []string {
-	if remote == nil || remote.ExtraConfig == nil {
-		return nil
-	}
-	if v, ok := remote.ExtraConfig["KAFKA_BROKERS"]; ok {
-		switch vv := v.(type) {
-		case []interface{}:
-			out := make([]string, 0, len(vv))
-			for _, e := range vv {
-				if s, ok := e.(string); ok && s != "" {
-					out = append(out, s)
-				}
-			}
-			return out
-		case []string:
-			return vv
-		case string:
-			if vv != "" {
-				return []string{vv}
-			}
-		}
-	}
-	return nil
+func init() {
+	fmt.Println("PLUGIN INIT: pubsub-publisher loaded")
 }
-
-// ==================== Helper functions ====================
-func (f *BackendFactory) setProducerHealthy(val bool) {
-	f.producerLock.Lock()
-	f.producerHealthy = val
-	f.producerLock.Unlock()
-}
-
-func getConfig(remote *config.Backend, namespace string, v interface{}) error {
-	data, ok := remote.ExtraConfig[namespace]
-	if !ok {
-		return fmt.Errorf("%s not found in extra_config", namespace)
-	}
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(raw, &v)
-}
-func BackendFactoryFunc(ctx context.Context, logger logging.Logger, bf proxy.BackendFactory) proxy.BackendFactory {
-	    logger.Info("🚀 My Plugin successfully loaded!")
-    return NewBackendFactory(ctx, logger, bf).New
-}
-
-var Plugin = BackendFactoryFunc
