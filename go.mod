@@ -1,6 +1,6 @@
 module krakend-twpubsub-plugin
 
-go 1.22
+go 1.24
 
 require (
 	github.com/IBM/sarama v1.45.2
