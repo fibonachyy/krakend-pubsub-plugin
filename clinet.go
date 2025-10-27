@@ -95,7 +95,7 @@ func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backe
 	saramaCfg.Producer.Retry.Max = 5
 	saramaCfg.Producer.Return.Successes = true
 
-	producer, err := sarama.NewSyncProducer(brokers, saramaCfg)
+	producer, err := sarama.NewSyncProducer([]string{"kafka:9092"}, saramaCfg)
 	if err != nil {
 		return nil, fmt.Errorf("producer init error: %v", err)
 	}
