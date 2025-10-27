@@ -145,6 +145,7 @@ func (f *BackendFactory) setProducerHealthy(val bool) {
 
 // parseBrokers reads Kafka brokers from extra_config
 func parseBrokers(remote *config.Backend) []string {
+	fmt.Println(remote)
 	if remote == nil || remote.ExtraConfig == nil {
 		return nil
 	}
