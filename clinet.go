@@ -42,7 +42,7 @@ type BackendFactory struct {
 
 // NewBackendFactory constructor
 func NewBackendFactory(ctx context.Context, logger logging.Logger, bf proxy.BackendFactory) *BackendFactory {
-		fmt.Println("NewBackendFactory")
+	fmt.Println("NewBackendFactory")
 
 	return &BackendFactory{
 		ctx:    ctx,
@@ -54,15 +54,15 @@ func NewBackendFactory(ctx context.Context, logger logging.Logger, bf proxy.Back
 // New returns a proxy.Proxy for the backend
 func (f *BackendFactory) New(remote *config.Backend) proxy.Proxy {
 	fmt.Println("New")
-    prxy, err := f.initPublisher(f.ctx, remote)
-    if err != nil {
-        if f.logger != nil {
-            f.logger.Warning(fmt.Sprintf("publisher not initialized: %v", err))
-        }
-        // fallback to NoopProxy instead of calling bf(remote)
-        return proxy.NoopProxy
-    }
-    return prxy
+	prxy, err := f.initPublisher(f.ctx, remote)
+	if err != nil {
+		if f.logger != nil {
+			f.logger.Warning(fmt.Sprintf("publisher not initialized: %v", err))
+		}
+		// fallback to NoopProxy instead of calling bf(remote)
+		return proxy.NoopProxy
+	}
+	return prxy
 }
 
 // initPublisher initializes Kafka producer and returns a proxy
@@ -80,7 +80,8 @@ func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backe
 		return nil, fmt.Errorf("missing topic_url in %s", pluginNamespace)
 	}
 	f.producerTopic = cfg.TopicURL
-
+	f.logger.Warning("remote", remote)
+	f.logger.Warning("cfg", cfg)
 	brokers := cfg.Brokers
 	if len(brokers) == 0 {
 		brokers = parseBrokers(remote)
@@ -199,7 +200,7 @@ func parseBrokers(remote *config.Backend) []string {
 
 // getConfig unmarshals extra_config[namespace] into v
 func getConfig(remote *config.Backend, namespace string, v interface{}) error {
-	fmt.Println("getConfig",remote)
+	fmt.Println("getConfig", remote)
 	data, ok := remote.ExtraConfig[namespace]
 	if !ok {
 		return fmt.Errorf("%s not found in extra_config", namespace)
