@@ -67,7 +67,7 @@ func (f *BackendFactory) New(remote *config.Backend) proxy.Proxy {
 
 // initPublisher initializes Kafka producer and returns a proxy
 func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backend) (proxy.Proxy, error) {
-	fmt.Println("initPublisher")
+	f.logger.Info("initPublisher")
 	if remote == nil {
 		return nil, fmt.Errorf("remote backend is nil")
 	}
@@ -107,7 +107,7 @@ func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backe
 
 	// Return the proxy
 	return func(ctx context.Context, r *proxy.Request) (*proxy.Response, error) {
-		fmt.Println("test")
+		f.logger.Info("test")
 		var body []byte
 		if r.Body != nil {
 			b, err := io.ReadAll(r.Body)
@@ -146,7 +146,7 @@ func (f *BackendFactory) setProducerHealthy(val bool) {
 
 // parseBrokers reads Kafka brokers from extra_config
 func parseBrokers(remote *config.Backend) []string {
-	fmt.Println(remote)
+
 	if remote == nil || remote.ExtraConfig == nil {
 		return nil
 	}
@@ -200,7 +200,6 @@ func parseBrokers(remote *config.Backend) []string {
 
 // getConfig unmarshals extra_config[namespace] into v
 func getConfig(remote *config.Backend, namespace string, v interface{}) error {
-	fmt.Println("getConfig", remote)
 	data, ok := remote.ExtraConfig[namespace]
 	if !ok {
 		return fmt.Errorf("%s not found in extra_config", namespace)
