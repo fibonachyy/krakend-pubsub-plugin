@@ -73,11 +73,11 @@ func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backe
 	}
 
 	cfg := &publisherCfg{}
-	if err := getConfig(remote, pluginNamespace, cfg); err != nil {
+	if err := getConfig(remote, publisherNamespace, cfg); err != nil {
 		return nil, fmt.Errorf("config error: %v", err)
 	}
 	if cfg.TopicURL == "" {
-		return nil, fmt.Errorf("missing topic_url in %s", pluginNamespace)
+		return nil, fmt.Errorf("missing topic_url in %s", publisherNamespace)
 	}
 	f.producerTopic = cfg.TopicURL
 	f.logger.Warning("remote", remote)
@@ -172,7 +172,7 @@ func parseBrokers(remote *config.Backend) []string {
 	}
 
 	// nested under plugin namespace
-	if v, ok := remote.ExtraConfig[pluginNamespace]; ok {
+	if v, ok := remote.ExtraConfig[publisherNamespace]; ok {
 		if m, ok := v.(map[string]interface{}); ok {
 			if b, ok := m["brokers"]; ok {
 				switch bb := b.(type) {
