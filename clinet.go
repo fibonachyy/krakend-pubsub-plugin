@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/IBM/sarama"
@@ -43,17 +44,18 @@ type BackendFactory struct {
 // NewBackendFactory constructor
 func NewBackendFactory(ctx context.Context, logger logging.Logger, bf proxy.BackendFactory) *BackendFactory {
 	fmt.Println("NewBackendFactory")
-
+	lg, err := logging.NewLogger("DEBUG", os.Stderr, "[PLUGIN] ")
+	_ = err
 	return &BackendFactory{
 		ctx:    ctx,
-		logger: logger,
+		logger: lg,
 		bf:     bf,
 	}
 }
 
 // New returns a proxy.Proxy for the backend
 func (f *BackendFactory) New(remote *config.Backend) proxy.Proxy {
-	fmt.Println("New")
+	f.logger.Info("New")
 	prxy, err := f.initPublisher(f.ctx, remote)
 	if err != nil {
 		if f.logger != nil {
